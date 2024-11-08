@@ -1,0 +1,38 @@
+# Configuration for running connectors in bundle with connector-runtime
+
+# local connection
+camunda:
+ client:
+     mode: selfManaged
+     zeebe:
+       enabled: true
+       grpc-address: http://localhost:26500
+       rest-address: http://localhost:8088
+       preferRestOverGrpc: false
+
+
+
+
+
+# Don't run the connection to Operate (not an inbound connection)
+camunda.connector.polling.enabled: false
+camunda.connector.webhook.enabled: false
+spring.main.web-application-type: none
+operate.client.enabled: false
+
+tasklist:
+  url: http://localhost:8082
+  username: demo
+  userpassword: demo
+  clientIdNotNeed: tasklist
+  clientId:
+  clientSecret: XALaRPl5qwTEItdwCMiPS62nVpKs7dL7
+  taskListKeycloakUrl: http://localhost:18080/auth/realms/camunda-platform/protocol/openid-connect/token
+
+usertaskwithresult:
+  # single|multiple
+  modeExecution: single
+  pleaseLogWorker: false
+  doubleCheck: true
+  useTaskAPI: false
+
