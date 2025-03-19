@@ -49,7 +49,7 @@ A user task is present in the process, and the application wants to call an API 
 
 The API is
 
-```java
+```
  /**
    * executeTaskWithResult
    *
@@ -70,7 +70,7 @@ The API is
 ```
 
 For example, it can be called via
-```java
+```
 TaskWithResult.ExecuteWithResult executeWithResult = taskWithResult.executeTaskWithResult(userTask,
       true,
       "demo",
@@ -93,13 +93,13 @@ It must register the type
 In Zeebe, the call is asynchronous. So when the Zeebe API `completeTask` is called, the thread is free and can continue the execution.
 
 So, the idea is to block it on an object
-```java
+```
    // Now, we block the thread and wait for a result
     lockObjectTransporter.waitForResult(timeoutDurationInMs);
 ```
 
 This object was created just before and saved in a map. The Key is the jobKey, which is unique.
-```java
+```
  LockObjectTransporter lockObjectTransporter = new LockObjectTransporter();
     lockObjectTransporter.jobKey = jobKey;
     synchronized (lockObjectsMap) {
@@ -109,7 +109,7 @@ This object was created just before and saved in a map. The Key is the jobKey, w
 ```
 
 The object is notified in the worker:
-```java
+```
   private class HandleMarker implements JobHandler {
     public void handle(JobClient jobClient, ActivatedJob activatedJob) throws Exception {
       // Get the variable "lockKey"
@@ -134,7 +134,7 @@ When activated, the worker must retrieve the waiting object in the Map. The `job
 We need to activate the handler call specifically to be sure this is on the same Java machine. This method can be implemented in an application deployed in a replica.
 To ensure that the worker is dynamic, the topic contains the job Key and the method for registering the new worker.
 
-```java
+```
    JobWorker worker = zeebeClient.newWorker()
         .jobType("end-result-" + jobKey)
         .handler(handleMarker)
@@ -168,15 +168,19 @@ For the limitation "application is stopped", it is possible to add a Timer Bound
 ## in a listener
 The mechanism is not visible in the BPMN and does not bother the Business modeler.
 
-However, the "Application is stopped" issue becomes a real one because there is no mechanism to bypass a listener. It has to be executed, and it's not possible to add a timer. If the application is stopped when some process instances are captured, only a general timer event or a timer on the task (which will cancel the task, too) is possible.
+However, the "Application is stopped" issue becomes a real one because there is no mechanism to bypass a START listener. 
+A START listener has to be executed. a END listener can be interrupted by a timer. 
 
 # Limitations
 
-## Application is stopped
+## Application is blocked
 
 If the application is stopped, the unique worker is stopped, too.
 And because it is based on a "random" number (the number is the job key or the process instance), the application, when it will be restarted, workers will not be created.
 Then, the process instance is stuck forever in the worker.
+
+To avoid that, a timer must be placed on the service task
+![ServiceTaskWithTimer](doc/ServiceTaskWithTimer.png)
 
 ## Parallel path
 
@@ -203,7 +207,7 @@ This application runs the `src/main/java/io/camunda/executewithresult/scenario/S
 This application will connect to a Zeebe Server.
 (check the `src/main/resources/application.yaml` to describe the connection) and every 30 seconds, it will create a process instance in the process
 
-```java
+```
 public static final String PROCESS_ID = "executeUserTaskWithResultListener";
 ```
 Note: there are two examples, so change the PROCESS_ID to run one or another method
