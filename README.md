@@ -6,6 +6,19 @@
 
 # C8-execute-usertask-with-result
 
+# What's news in 2.0?
+This implementation reach a next level in term of performance. Executing 1 service task, and wait for the result can be done now in 24 ms, 3000 PI/s on a 30 clauster size.
+
+The implementation offer now:
+* CreateProcessInstanceWithResult
+* publishNewMessageWithResult
+
+Two implementations on the worker are available:
+* Dynamic (old one) create one worker per request. 
+* Host: create one worker per host, which is faster because the worker is created at begining, and its never stops. This offer an higher throughput and reduce the backpressure on the server.
+
+Signature change: now all API offer a CompletableFuture object, which allow to implement a Reactive programing option.
+
 # Principle
 
 Let's start with a process like this.
@@ -50,32 +63,74 @@ A user task is present in the process, and the application wants to call an API 
 The API is
 
 ```
- /**
-   * executeTaskWithResult
-   *
-   * @param userTask            user task to execute
-   * @param assignUser          the user wasn't assigned to the user task, so do it
-   * @param userName            userName to execute the user task
-   * @param variables           Variables to update the task at completion
-   * @param timeoutDurationInMs maximum duration time, after the ExceptionWithResult.timeOut is true
-   * @return the process variable
-   * @throws Exception
-   */
-  public ExecuteWithResult executeTaskWithResult(Task userTask,
-                                                 boolean assignUser,
-                                                 String userName,
-                                                 Map<String, Object> variables,
-                                                 long timeoutDurationInMs) throws Exception
+  /**
+     * processInstanceWithResult
+     *
+     * @param processId       processId to start
+     * @param variables       Variables to update the task at completion
+     * @param jobKey          key to wait for the worker
+     * @param timeoutDuration maximum duration time, after the ExceptionWithResult.timeOut is true
+     * @return the result status
+     * @throws Exception in case of error
+     */
+    public CompletableFuture<ExecuteWithResult> processInstanceWithResult(String processId,
+                                                                          Map<String, Object> variables,
+                                                                          String jobKey,
+                                                                          String prefixTopicWorker,
+                                                                          Duration timeoutDuration) throws Exception {
 
+}
+
+  /**
+     * executeTaskWithResult
+     *
+     * @param userTask        user task to execute
+     * @param assignUser      the user wasn't assign to the user task, so do it
+     * @param userName        userName to execute the user task
+     * @param variables       Variables to update the task at completion
+     * @param timeoutDuration maximum duration time, after the ExceptionWithResult.timeOut is true
+     * @return the result variable
+     * @throws Exception for any error
+     */
+    public CompletableFuture<ExecuteWithResult> executeTaskWithResult(Task userTask,
+                                                                      boolean assignUser,
+                                                                      String userName,
+                                                                      Map<String, Object> variables,
+                                                                      String prefixTopicWorker,
+                                                                      Duration timeoutDuration) throws Exception {
+ 
+ }  
+    /**
+     * Publish message and wait until the worker handle the point
+     *
+     * @param messageName message name
+     * @param correlationKey key to send to the corelation
+     * @param timeToLive Duration to live the message
+     * @param variables variables to send to the message
+     * @param jobKey Key, must be unique to match when the message will arrive at the handle method
+     * @param prefixTopicWorker prefix to use for the worker
+     * @param timeoutDuration duration, after this delay, the API will be unlocked
+     * @return a Future
+     * @throws Exception
+     */
+    public CompletableFuture<ExecuteWithResult> publishNewMessageWithResult(String messageName,
+                                                                            String correlationKey,
+                                                                            Duration timeToLive,
+                                                                            Map<String, Object> variables,
+                                                                            String jobKey,
+                                                                            String prefixTopicWorker,
+                                                                            Duration timeoutDuration) throws Exception {
+  }
 ```
 
 For example, it can be called via
 ```
-TaskWithResult.ExecuteWithResult executeWithResult = taskWithResult.executeTaskWithResult(userTask,
-      true,
-      "demo",
-      userVariable, 
-      10000L);
+      ExecuteWithResult executeWithResult = taskWithResult.executeTaskWithResult(task, true,
+                "demo",
+                Map.of("Cake", "Cherry"),
+                "UserTaskWithResult",
+                Duration.ofMinutes(2)).join();
+
 ```
 
 
@@ -84,7 +139,7 @@ TaskWithResult.ExecuteWithResult executeWithResult = taskWithResult.executeTaskW
 A marker must be placed when the result should return. The process is then initiated with a service task (or a listener in 8.6 or later).
 It must register the type
 ```feel
-"end-result-"+jobKey
+topicEndResult
 ```
 
 ![InstrumentTask.png](doc/InstrumentTask.png)
@@ -92,11 +147,8 @@ It must register the type
 ## How it's work
 In Zeebe, the call is asynchronous. So when the Zeebe API `completeTask` is called, the thread is free and can continue the execution.
 
-So, the idea is to block it on an object
-```
-   // Now, we block the thread and wait for a result
-    lockObjectTransporter.waitForResult(timeoutDurationInMs);
-```
+So, the idea is to create an lockObjectTransport object, registered it on a unique key, and on the worker at the end, retrieve the object and "complete" the CompletableFuture
+
 
 This object was created just before and saved in a map. The Key is the jobKey, which is unique.
 ```
@@ -110,23 +162,31 @@ This object was created just before and saved in a map. The Key is the jobKey, w
 
 The object is notified in the worker:
 ```
-  private class HandleMarker implements JobHandler {
-    public void handle(JobClient jobClient, ActivatedJob activatedJob) throws Exception {
-      // Get the variable "lockKey"
-      String jobKey = (String) activatedJob.getVariable("jobKey");
-      logger.info("Handle marker for jobKey[{}]", jobKey);
-      LockObjectTransporter lockObjectTransporter = lockObjectsMap.get(jobKey);
+       public void handle(JobClient jobClient, ActivatedJob activatedJob) throws Exception {
+            // Get the variable "lockKey"
+            jobClient.newCompleteCommand(activatedJob.getKey()).send();
 
-      if (lockObjectTransporter == null) {
-        logger.error("No object for jobKey[{}]", jobKey);
-        return;
-      }
-      lockObjectTransporter.processVariables = activatedJob.getVariablesAsMap();
-      logger.debug("HandleMarker jobKey[{}] variables[{}]", jobKey, lockObjectTransporter.processVariables);
+            String jobKey = (String) activatedJob.getVariable(WithResultAPI.PROCESS_VARIABLE_JOB_KEY);
+            // logger.info("Handle marker for jobKey[{}]", jobKey);
+            ResultWorkerDynamic.LockObjectTransporter lockObjectTransporter = lockObjectsMap.get(jobKey);
 
-      // Notify the thread waiting on this item
-      lockObjectTransporter.notifyResult();
-    }
+            if (lockObjectTransporter == null) {
+                logger.error("No object for jobKey[{}]", jobKey);
+                return;
+            }
+            lockObjectTransporter.processVariables = activatedJob.getVariablesAsMap();
+            lockObjectTransporter.elementId = activatedJob.getElementId();
+            lockObjectTransporter.elementInstanceKey = activatedJob.getElementInstanceKey();
+            logger.debug("HandleMarkerDynamicWorker jobKey[{}] variables[{}]", jobKey, lockObjectTransporter.processVariables);
+
+            // notify withResult that we got the answer
+            switch(lockObjectTransporter.caller) {
+                case PROCESSINSTANCE -> withResultAPI.completeLaterProcessInstanceWithResult(lockObjectTransporter);
+                case USERTASK -> withResultAPI.completeLaterExecuteTaskWithResult(lockObjectTransporter);
+                case MESSAGE -> withResultAPI.completeLaterPublishMessageWithResult(lockObjectTransporter);
+            }
+
+        }
 ```
 
 When activated, the worker must retrieve the waiting object in the Map. The `jobKey` must be passed as a process variable.
@@ -134,27 +194,147 @@ When activated, the worker must retrieve the waiting object in the Map. The `job
 We need to activate the handler call specifically to be sure this is on the same Java machine. This method can be implemented in an application deployed in a replica.
 To ensure that the worker is dynamic, the topic contains the job Key and the method for registering the new worker.
 
+
+On the Dynamic implementation, for each request, a worker is created
 ```
-   JobWorker worker = zeebeClient.newWorker()
-        .jobType("end-result-" + jobKey)
-        .handler(handleMarker)
-        .streamEnabled(true)
-        .open();
+        LockObjectTransporter lockObjectTransporter = new LockObjectTransporter();
+        lockObjectTransporter.jobKey = jobKey;
+        lockObjectTransporter.context = context;
+        lockObjectTransporter.caller = caller;
+
+        logger.debug("Register worker[{}]", getTopic(context, prefixTopicWorker, jobKey));
+
+        lockObjectTransporter.worker = zeebeClient.newWorker()
+                .jobType(getTopic(context, prefixTopicWorker, jobKey))
+                .handler(handleMarkerDynamicWorker)
+                .streamEnabled(true)
+                .open();
+
+        synchronized (lockObjectsMap) {
+            lockObjectsMap.put(jobKey, lockObjectTransporter);
+        }
+
+        return lockObjectTransporter;
 ```
+
+in the Host implementation, the worker is created per host
+
+```
+       LockObjectTransporter lockObjectTransporter = new LockObjectTransporter();
+        lockObjectTransporter.jobKey = jobKey;
+        lockObjectTransporter.context = context;
+        lockObjectTransporter.caller = caller;
+
+        logger.debug("Register worker[{}] jobKey[{}]", getTopic(context, prefixTopicWorker, jobKey), jobKey);
+
+        JobWorker worker = getWorker(getTopic(context, prefixTopicWorker, jobKey));
+
+        synchronized (lockObjectsMap) {
+            lockObjectsMap.put(jobKey, lockObjectTransporter);
+        }
+
+        return lockObjectTransporter;
+```
+
+and the getWorker is
+```` 
+    static final Map<String, LockObjectTransporter> lockObjectsMap = new ConcurrentHashMap<>();
+    static final ConcurrentHashMap<String, JobWorker> mapWorker = new ConcurrentHashMap<>();
+    final ZeebeClient zeebeClient;
+    final HandlerEndResult handleMarker;
+    final String podName;
+    Logger logger = LoggerFactory.getLogger(ResultWorkerHost.class.getName());
+
+    ResultWorkerHost(ZeebeClient zeebeClient, String podName, WithResultAPI withResultAPI) {
+        this.zeebeClient = zeebeClient;
+        this.podName = podName;
+        this.handleMarker = new HandlerEndResult(withResultAPI);
+    }
+
+
+    /**
+     * Open the transaction. Worker may be created the first time, then reuse. It return a lockObjectTransporter, and the caller can modify it.
+     * The caller will execute the command (create a process instance, execute the user task, publish the message). The caller must pass the jobKey
+     * as a process variable WithResultAPI.PROCESS_VARIABLE_JOB_KEY. The handler retrieve the key, then the object, and will call the callback according
+     * the caller.
+     *
+     * @param context           information
+     * @param prefixTopicWorker prefix of the worker, to calculate the topic for the dynamic worker
+     * @param jobKey            key for the handler to retrieve the correct lockObjetTransporter
+     * @param caller            who call the transaction, to have the callback method
+     * @return
+     */
+    @Override
+    public LockObjectTransporter openTransaction(String context, String prefixTopicWorker, String jobKey, LockObjectTransporter.CALLER caller) {
+        LockObjectTransporter lockObjectTransporter = new LockObjectTransporter();
+        lockObjectTransporter.jobKey = jobKey;
+        lockObjectTransporter.context = context;
+        lockObjectTransporter.caller = caller;
+
+        logger.debug("Register worker[{}] jobKey[{}]", getTopic(context, prefixTopicWorker, jobKey), jobKey);
+
+        JobWorker worker = getWorker(getTopic(context, prefixTopicWorker, jobKey));
+
+        synchronized (lockObjectsMap) {
+            lockObjectsMap.put(jobKey, lockObjectTransporter);
+        }
+
+        return lockObjectTransporter;
+    }
+
+    /**
+     * The topic is different per host
+     *
+     * @param context
+     * @param prefixTopicWorker
+     * @param jobKey
+     * @return
+     */
+    @Override
+    public String getTopic(String context, String prefixTopicWorker, String jobKey) {
+        return prefixTopicWorker + podName;
+    }
+
+
+    @Override
+    public void closeTransaction(LockObjectTransporter lockObjectTransporter) {
+        // we got the result
+        // we can close the worker now
+        synchronized (lockObjectsMap) {
+            lockObjectsMap.remove(lockObjectTransporter.jobKey);
+        }
+    }
+
+
+    private JobWorker getWorker(String topicName) {
+        JobWorker worker = mapWorker.get(topicName);
+        if (worker == null) {
+            synchronized (this) {
+                if (mapWorker.get(topicName) == null) {
+                    worker = zeebeClient.newWorker()
+                            .jobType(topicName)
+                            .handler(handleMarker)
+                            .streamEnabled(true)
+                            .open();
+                    mapWorker.put(topicName, worker);
+                }
+            }
+        }
+        return worker;
+    }
+
+````
+
 This is why the topic contains the jobKey. So, the same Java machine will run the worker.
 
-The second advantage is in execution time. Instead of having one worker running handle all the management, there is now one worker per execution.
-The worker will be notified faster in this way when the process instance reaches the task.
 
 
 # Create a process instance with the result
 
-The same behavior can be implemented for the Create process instance.
 The advantages between the ZeebeAPI withResult are:
 * ZeebeAPI withResult waits for the end of the process instance. This mechanism can be placed in the process and will trigger when the process instance reaches the marker, not at the end of the process instance
 * If the timeout fires, ZeebeAPI will return an exception without creating the process instance. If the use case is to cancel the process instance because it takes too much time, this is not possible. This API will send back the process instance created.
-
-Note: this implementation is not done at this moment
+* the API implement the CompletableFuture. It's possible to implement the caller in a ReactivePrograming way. 
 
 # Worker or Listener?
 Branching the worker in a service task or as a listener in any task is possible.
@@ -169,7 +349,7 @@ For the limitation "application is stopped", it is possible to add a Timer Bound
 The mechanism is not visible in the BPMN and does not bother the Business modeler.
 
 However, the "Application is stopped" issue becomes a real one because there is no mechanism to bypass a START listener. 
-A START listener has to be executed. a END listener can be interrupted by a timer. 
+A START listener has to be executed. A END listener can be interrupted by a timer. 
 
 # Limitations
 
@@ -187,8 +367,8 @@ To avoid that, a timer must be placed on the service task
 Let's take this process
 ![ExecuteParallelTask.png](doc/ExecuteParallelTask.png)
 
-The boundary of the execution is all the Ax tasks. To be sure that all tasks are executed, you want to wait until Q2, A3, and A4 are executed.
-Multiple markers must be placed, one for each path, and then the notification must be executed only when the free markers are reached.
+The boundary of the execution is all the tasks. To be sure that all tasks are executed, you want to wait until Q2, A3, and A4 are executed.
+Multiple markers must be placed, one for each path, and then the notification must be executed only when the three markers are reached.
 
 This is possible, but the number 3 must be hardcoded in the library or passed in as a process variable, which is not very fair.
 It becomes impossible when the parallel gateway is an inclusive gateway parallel to the condition. A process instance may follow one, two, or three paths. How do you unlock it?
