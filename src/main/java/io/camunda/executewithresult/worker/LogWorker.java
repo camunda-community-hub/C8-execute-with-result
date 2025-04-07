@@ -11,25 +11,25 @@ import org.springframework.stereotype.Component;
 
 @Component
 public class LogWorker implements JobHandler {
-  public static final String PROCESS_VARIABLE_PLEASELOG = "pleaselog";
-  public static final String PROCESS_VARIABLE_MESSAGE = "message";
-  Logger logger = LoggerFactory.getLogger(LogWorker.class.getName());
+    public static final String PROCESS_VARIABLE_PLEASELOG = "pleaselog";
+    public static final String PROCESS_VARIABLE_MESSAGE = "message";
+    Logger logger = LoggerFactory.getLogger(LogWorker.class.getName());
 
-  public static JobWorker registerWorker(ZeebeClient zeebeClient) {
-    return zeebeClient.newWorker().jobType("log").handler(new LogWorker()).open();
+    public static JobWorker registerWorker(ZeebeClient zeebeClient) {
+        return zeebeClient.newWorker().jobType("log").handler(new LogWorker()).open();
 
-  }
+    }
 
-  public void handle(JobClient jobClient, ActivatedJob job) throws Exception {
+    public void handle(JobClient jobClient, ActivatedJob job) throws Exception {
 
-    Object message = job.getVariablesAsMap().get(PROCESS_VARIABLE_MESSAGE);
-    Object pleaseLog = job.getVariablesAsMap().get(PROCESS_VARIABLE_PLEASELOG);
+        Object message = job.getVariablesAsMap().get(PROCESS_VARIABLE_MESSAGE);
+        Object pleaseLog = job.getVariablesAsMap().get(PROCESS_VARIABLE_PLEASELOG);
 
-    if (pleaseLog != null && "true".equalsIgnoreCase(pleaseLog.toString()))
-      logger.info("WorkerLog. message[{}]", message);
+        if (pleaseLog != null && "true" .equalsIgnoreCase(pleaseLog.toString()))
+            logger.info("WorkerLog. message[{}]", message);
 
-    jobClient.newCompleteCommand(job.getKey()).send();
+        jobClient.newCompleteCommand(job.getKey()).send();
 
-  }
+    }
 
 }
