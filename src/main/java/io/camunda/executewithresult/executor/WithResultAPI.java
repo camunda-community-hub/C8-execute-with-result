@@ -13,21 +13,20 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 public class WithResultAPI {
-    public static final String PROCESS_VARIABLE_JOB_KEY = "jobKey";
+    public static final String PROCESS_VARIABLE_JOB_KEY = "JobKeyResult";
     public static final String PROCESS_VARIABLE_TOPIC_END_RESULT = "topicEndResult";
-    private final static String PROCESS_VARIABLE_SNITCH = "SNITCH";
     /**
      * Create a more large scheduler to handle if many timeout fire at the same time
      */
     private static final ScheduledExecutorService scheduler =
             Executors.newScheduledThreadPool(4);
-    private final boolean doubleCheck;
     private final ZeebeClient zeebeClient;
     private final CamundaTaskListClient taskClient;
     private final boolean useTaskAPI;
@@ -37,12 +36,10 @@ public class WithResultAPI {
 
     public WithResultAPI(ZeebeClient zeebeClient,
                          CamundaTaskListClient taskClient,
-                         boolean doubleCheck,
                          boolean useTaskAPI,
                          ResultWorker.WorkerImplementation resultWorker) {
         this.zeebeClient = zeebeClient;
         this.taskClient = taskClient;
-        this.doubleCheck = doubleCheck;
         this.useTaskAPI = useTaskAPI;
         String podName = String.valueOf(System.currentTimeMillis());
         try {
@@ -58,6 +55,97 @@ public class WithResultAPI {
         }
     }
 
+
+    /**
+     * processInstanceWithResult
+     *
+     * @param processId       processId to start
+     * @param variables       Variables to update the task at completion
+     * @param timeoutDuration maximum duration time, after the ExceptionWithResult.timeOut is true
+     * @return the result status
+     * @throws Exception in case of error
+     */
+    public CompletableFuture<ExecuteWithResult> processInstanceWithResult(String processId,
+                                                                          Map<String, Object> variables,
+                                                                          String prefixTopicWorker,
+                                                                          Duration timeoutDuration) throws Exception {
+
+        // We need to create a unique ID
+        // to retrieve the caller:
+        // worker must be on the same JVM, so only the worker started on the same JVM must catch it
+        // PROCESS_VARIABLE_TOPIC_END_RESULT contains the signature of the worker started it
+        // PROCESS_VARIABLE_JOB_KEY contains the key of this request, must be unia
+        String jobKey = UUID.randomUUID().toString();
+
+        logger.debug("ExecuteTaskWithResult processId[{}] jobKey[{}]", processId, jobKey);
+
+        // get the transporter
+        ResultWorker.LockObjectTransporter lockObjectTransporter = resultWorker.openTransaction("createProcessInstance", prefixTopicWorker, jobKey, ResultWorker.LockObjectTransporter.CALLER.PROCESSINSTANCE);
+        lockObjectTransporter.timeoutDuration = timeoutDuration;
+
+        Map<String, Object> processVariables = new HashMap<>();
+        processVariables.put(PROCESS_VARIABLE_JOB_KEY, jobKey);
+        processVariables.put(PROCESS_VARIABLE_TOPIC_END_RESULT, resultWorker.getTopic("createProcessInstance", prefixTopicWorker, jobKey));
+        processVariables.putAll(variables);
+        ExecuteWithResult executeWithResult = new ExecuteWithResult();
+
+        // save the variable jobId
+        try {
+
+            ProcessInstanceEvent processInstanceEvent = zeebeClient.newCreateInstanceCommand().bpmnProcessId(processId).latestVersion().variables(processVariables).send().join();
+            executeWithResult.processInstance = processInstanceEvent.getProcessInstanceKey();
+            // logger.info("Create process instance {} jobKey [{}]", executeWithResult.processInstance,jobKey);
+        } catch (Exception e) {
+            logger.error("Can't create process instance[{}] : {}", processId, e.getMessage());
+            executeWithResult.creationError = true;
+            lockObjectTransporter.future.complete(executeWithResult);
+            return lockObjectTransporter.future;
+        }
+
+        // Now, we block the thread and wait for a result
+        scheduler.schedule(() -> {
+            if (!lockObjectTransporter.future.isDone()) {
+                executeWithResult.timeOut = true;
+                lockObjectTransporter.future.complete(executeWithResult);
+            }
+        }, timeoutDuration.toMillis(), TimeUnit.MILLISECONDS);
+
+        return lockObjectTransporter.future;
+    }
+
+    /**
+     * Callback here when we got a result
+     *
+     * @param lockObjectTransporter
+     */
+    protected void completeLaterProcessInstanceWithResult(ResultWorker.LockObjectTransporter lockObjectTransporter) {
+        if (lockObjectTransporter.future.isDone())
+            return;
+
+        // logger.debug("Receive answer jobKey[{}] notification? {} inprogress {}", jobKey, lockObjectTransporter.notification, lockObjectsMap.size());
+        ExecuteWithResult executeWithResult = new ExecuteWithResult();
+
+        // retrieve the taskId where the currentprocess instance is
+        executeWithResult.elementId = lockObjectTransporter.elementId;
+        executeWithResult.elementInstanceKey = lockObjectTransporter.elementInstanceKey;
+
+        resultWorker.closeTransaction(lockObjectTransporter);
+
+        Long endTime = System.currentTimeMillis();
+        executeWithResult.executionTime = endTime - lockObjectTransporter.beginTime;
+
+        executeWithResult.timeOut = false;
+        executeWithResult.processVariables = lockObjectTransporter.processVariables;
+        String doubleCheckAnalysis = "";
+        logger.debug("RESULT JobKey[{}] in {} ms (timeout {} ms) Pid[{}] {} variables[{}]", lockObjectTransporter.jobKey, endTime - lockObjectTransporter.beginTime,
+                lockObjectTransporter.timeoutDuration.toMillis(), executeWithResult.processInstance, doubleCheckAnalysis,
+                lockObjectTransporter.processVariables);
+
+
+        lockObjectTransporter.future.complete(executeWithResult);
+
+
+    }
 
     /**
      * executeTaskWithResult
@@ -88,11 +176,9 @@ public class WithResultAPI {
         lockObjectTransporter.timeoutDuration = timeoutDuration;
 
         Map<String, Object> userVariables = new HashMap<>();
-        userVariables.put(PROCESS_VARIABLE_JOB_KEY, jobKey);
+        // userVariables.put(PROCESS_VARIABLE_JOB_KEY, jobKey);
         userVariables.put(PROCESS_VARIABLE_TOPIC_END_RESULT, resultWorker.getTopic("userTask", prefixTopicWorker, jobKey));
         userVariables.putAll(variables);
-        if (doubleCheck)
-            userVariables.put(PROCESS_VARIABLE_SNITCH, snitchValue);
         ExecuteWithResult executeWithResult = new ExecuteWithResult();
 
         // save the variable jobId
@@ -131,11 +217,11 @@ public class WithResultAPI {
     }
 
     /**
-     * Complete execute task with result: the worker handle the result, and call back.
+     * Complete execute task with result: the worker handles the result, and calls back.
      *
      * @param lockObjectTransporter
      */
-    public void completeLaterExecuteTaskWithResult(ResultWorker.LockObjectTransporter lockObjectTransporter) {
+    protected void completeLaterExecuteTaskWithResult(ResultWorker.LockObjectTransporter lockObjectTransporter) {
         if (lockObjectTransporter.future.isDone())
             return;
         ExecuteWithResult executeWithResult = new ExecuteWithResult();
@@ -156,13 +242,6 @@ public class WithResultAPI {
         executeWithResult.timeOut = false;
         executeWithResult.processVariables = lockObjectTransporter.processVariables;
         String doubleCheckAnalysis = "";
-        if (doubleCheck) {
-            String jobKeyProcess = (String) lockObjectTransporter.processVariables.get("jobKey");
-            Integer snitchProcess = (Integer) lockObjectTransporter.processVariables.get(PROCESS_VARIABLE_SNITCH);
-            doubleCheckAnalysis = snitchProcess == null || !snitchProcess.equals(lockObjectTransporter.snitchValue) ?
-                    String.format("Snitch_Different(snitch[%1d] SnichProcess[%2d])", lockObjectTransporter.snitchValue, snitchProcess) :
-                    "Snitch_marker_OK";
-        }
         logger.debug("RESULT JobKey[{}] in {} ms (timeout {} ms) Pid[{}] {} variables[{}]", lockObjectTransporter.jobKey, endTime - lockObjectTransporter.beginTime,
                 lockObjectTransporter.timeoutDuration.toMillis(), lockObjectTransporter.userTask.getProcessInstanceKey(), doubleCheckAnalysis,
                 lockObjectTransporter.processVariables);
@@ -172,103 +251,6 @@ public class WithResultAPI {
     }
 
 
-    /**
-     * processInstanceWithResult
-     *
-     * @param processId       processId to start
-     * @param variables       Variables to update the task at completion
-     * @param jobKey          key to wait for the worker
-     * @param timeoutDuration maximum duration time, after the ExceptionWithResult.timeOut is true
-     * @return the result status
-     * @throws Exception in case of error
-     */
-    public CompletableFuture<ExecuteWithResult> processInstanceWithResult(String processId,
-                                                                          Map<String, Object> variables,
-                                                                          String jobKey,
-                                                                          String prefixTopicWorker,
-                                                                          Duration timeoutDuration) throws Exception {
-
-        // We need to create a unique ID
-
-        logger.debug("ExecuteTaskWithResult[{}]", jobKey);
-
-
-        // get the transporter
-        ResultWorker.LockObjectTransporter lockObjectTransporter = resultWorker.openTransaction("createProcessInstance", prefixTopicWorker, jobKey, ResultWorker.LockObjectTransporter.CALLER.PROCESSINSTANCE);
-        lockObjectTransporter.snitchValue = random.nextInt(10000);
-        lockObjectTransporter.timeoutDuration = timeoutDuration;
-
-        Map<String, Object> processVariables = new HashMap<>();
-        processVariables.put(PROCESS_VARIABLE_JOB_KEY, jobKey);
-        processVariables.put(PROCESS_VARIABLE_TOPIC_END_RESULT, resultWorker.getTopic("createProcessInstance", prefixTopicWorker, jobKey));
-        processVariables.putAll(variables);
-        ExecuteWithResult executeWithResult = new ExecuteWithResult();
-
-        // save the variable jobId
-        try {
-
-            ProcessInstanceEvent processInstanceEvent = zeebeClient.newCreateInstanceCommand().bpmnProcessId(processId).latestVersion().variables(processVariables).send().join();
-            executeWithResult.processInstance = processInstanceEvent.getProcessInstanceKey();
-            // logger.info("Create process instance {} jobKey [{}]", executeWithResult.processInstance,jobKey);
-        } catch (Exception e) {
-            logger.error("Can't create process instance[{}] : {}", processId, e.getMessage());
-            executeWithResult.creationError = true;
-            lockObjectTransporter.future.complete(executeWithResult);
-            return lockObjectTransporter.future;
-        }
-
-        // Now, we block the thread and wait for a result
-        scheduler.schedule(() -> {
-            if (!lockObjectTransporter.future.isDone()) {
-                executeWithResult.timeOut = true;
-                lockObjectTransporter.future.complete(executeWithResult);
-            }
-        }, timeoutDuration.toMillis(), TimeUnit.MILLISECONDS);
-
-        return lockObjectTransporter.future;
-    }
-
-    /**
-     * Callback here when we got a result
-     *
-     * @param lockObjectTransporter
-     */
-    public void completeLaterProcessInstanceWithResult(ResultWorker.LockObjectTransporter lockObjectTransporter) {
-        if (lockObjectTransporter.future.isDone())
-            return;
-
-        // logger.debug("Receive answer jobKey[{}] notification? {} inprogress {}", jobKey, lockObjectTransporter.notification, lockObjectsMap.size());
-        ExecuteWithResult executeWithResult = new ExecuteWithResult();
-
-        // retrieve the taskId where the currentprocess instance is
-        executeWithResult.elementId = lockObjectTransporter.elementId;
-        executeWithResult.elementInstanceKey = lockObjectTransporter.elementInstanceKey;
-
-        resultWorker.closeTransaction(lockObjectTransporter);
-
-        Long endTime = System.currentTimeMillis();
-        executeWithResult.executionTime = endTime - lockObjectTransporter.beginTime;
-
-        executeWithResult.timeOut = false;
-        executeWithResult.processVariables = lockObjectTransporter.processVariables;
-        String doubleCheckAnalysis = "";
-        if (doubleCheck) {
-            String jobKeyProcess = (String) lockObjectTransporter.processVariables.get("jobKey");
-            Integer snitchProcess = (Integer) lockObjectTransporter.processVariables.get(PROCESS_VARIABLE_SNITCH);
-            doubleCheckAnalysis = snitchProcess == null || !snitchProcess.equals(lockObjectTransporter.snitchValue) ?
-                    String.format("Snitch_Different(snitch[%1d] SnichProcess[%2d])", lockObjectTransporter.snitchValue, snitchProcess) :
-                    "Snitch_marker_OK";
-        }
-        logger.debug("RESULT JobKey[{}] in {} ms (timeout {} ms) Pid[{}] {} variables[{}]", lockObjectTransporter.jobKey, endTime - lockObjectTransporter.beginTime,
-                lockObjectTransporter.timeoutDuration.toMillis(), executeWithResult.processInstance, doubleCheckAnalysis,
-                lockObjectTransporter.processVariables);
-
-
-        lockObjectTransporter.future.complete(executeWithResult);
-
-
-    }
-
 
     /**
      * Publish message and wait until the worker handle the point
@@ -277,7 +259,6 @@ public class WithResultAPI {
      * @param correlationKey    key to send to the corelation
      * @param timeToLive        Duration to live the message
      * @param variables         variables to send to the message
-     * @param jobKey            Key, must be unique to match when the message will arrive at the handle method
      * @param prefixTopicWorker prefix to use for the worker
      * @param timeoutDuration   duration, after this delay, the API will be unlocked
      * @return a Future
@@ -287,9 +268,13 @@ public class WithResultAPI {
                                                                             String correlationKey,
                                                                             Duration timeToLive,
                                                                             Map<String, Object> variables,
-                                                                            String jobKey,
                                                                             String prefixTopicWorker,
                                                                             Duration timeoutDuration) throws Exception {
+        // to retrieve the caller:
+        // worker must be on the same JVM, so only the worker started on the same JVM must catch it
+        // PROCESS_VARIABLE_TOPIC_END_RESULT contains the signature of the worker started it
+        // PROCESS_VARIABLE_JOB_KEY contains the key of this request, must be unia
+        String jobKey = UUID.randomUUID().toString();
         logger.debug("publishNewMessageWithResult[{}]", correlationKey);
 
         // get the transporter
@@ -338,7 +323,11 @@ public class WithResultAPI {
         return lockObjectTransporter.future;
     }
 
-    public void completeLaterPublishMessageWithResult(ResultWorker.LockObjectTransporter lockObjectTransporter) {
+    /**
+     * THe worker execute the task, so the execution reach the expected point. This callback is called.
+     * @param lockObjectTransporter
+     */
+    protected void completeLaterPublishMessageWithResult(ResultWorker.LockObjectTransporter lockObjectTransporter) {
         if (lockObjectTransporter.future.isDone())
             return;
 

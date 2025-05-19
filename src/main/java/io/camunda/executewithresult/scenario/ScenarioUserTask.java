@@ -32,7 +32,9 @@ import java.util.stream.Collectors;
 @ConfigurationProperties()
 
 public class ScenarioUserTask {
-    public static final String PROCESS_ID = "executeUserTaskWithResultListener";
+    public static final String PROCESS_ID_USERTASK = "executeUserTaskWithResultListener";
+
+    public static final String PROCESS_ID_PROCESSINSTANCE = "ExecuteProcessInstanceWithResult";
     @Value("${tasklist.url}")
     public String taskListUrl;
     @Value("${tasklist.username}")
@@ -49,17 +51,16 @@ public class ScenarioUserTask {
     public String modeExecution;
     @Value("${usertaskwithresult.pleaseLogWorker:'false'}")
     public Boolean pleaseLogWorker;
-    @Value("${usertaskwithresult.pleaseLogWorker:'true'}")
-    public Boolean doubleCheck;
-    @Value("${usertaskwithresult.useTaskAPI:'false'}")
+     @Value("${usertaskwithresult.useTaskAPI:'false'}")
     public Boolean useTaskAAPI;
     Logger logger = LoggerFactory.getLogger(ScenarioUserTask.class.getName());
+
+    Random random = new Random();
     @Autowired
     ZeebeClient zeebeClient;
-    WithResultAPI taskWithResult;
+    WithResultAPI withResultAPI;
     EngineCommand engineCommand;
     List<JobWorker> listWorkers = new ArrayList<>();
-    Random random = new Random();
     ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(100);
     Set<Long> registerUserTask = new HashSet<>();
     boolean initialisation = false;
@@ -74,47 +75,51 @@ public class ScenarioUserTask {
         if (!connectionTaskList()) {
             return;
         }
-        taskWithResult = new WithResultAPI(zeebeClient, taskClient, doubleCheck, useTaskAAPI, ResultWorker.WorkerImplementation.HOST);
+        withResultAPI = new WithResultAPI(zeebeClient, taskClient, useTaskAAPI, ResultWorker.WorkerImplementation.HOST);
         engineCommand = new EngineCommand(zeebeClient, taskClient);
         // create workers
         listWorkers.add(DelayWorker.registerWorker(zeebeClient));
         listWorkers.add(LogWorker.registerWorker(zeebeClient));
         initialisation = true;
+        logger.info("Initialisation done");
     }
 
     @Scheduled(fixedDelay = 30000)
     public void execute() {
         if (!initialisation)
             return;
-        logger.info("ScenarioUserTask ---------------- Start a new bach");
+        logger.info("ScenarioUserTask ---------------- Start a new batch");
         numberExecution++;
         try {
             if ("single" .equals(modeExecution)) {
-                if (numberExecution > 1)
+                if (numberExecution > 1) {
+                    logger.info("Single execution, do nothing");
                     return;
-                executeSingleExecution();
+                }
+             //   executeSingleExecutionUserTask();
+                executeSingleExecutionProcessInstance();
             } else if ("multiple" .equals(modeExecution)) {
                 executeMultipleExecution();
             }
         } catch (Exception e) {
             logger.error("Error execution [{}]", e);
         }
-        logger.info("ScenarioUserTask ---------------- End bach");
+        logger.info("ScenarioUserTask ---------------- End batch");
 
     }
 
     /**
      * ExecuteOne Simple execution
      */
-    public void executeSingleExecution() throws Exception {
+    public void executeSingleExecutionUserTask() throws Exception {
         try {
-            engineCommand.createProcessInstances(PROCESS_ID,
+            engineCommand.createProcessInstances(PROCESS_ID_USERTASK,
                     Map.of(LogWorker.PROCESS_VARIABLE_PLEASELOG, Boolean.TRUE, DelayWorker.PROCESS_VARIABLE_CREDITSCORE,
                             random.nextInt(1000)), 1, true);
             int loop = 0;
             while (loop < 10) {
                 loop++;
-                TaskList taskList = engineCommand.searchUserTask(PROCESS_ID);
+                TaskList taskList = engineCommand.searchUserTask(PROCESS_ID_USERTASK);
                 if (taskList.getItems().isEmpty()) {
                     try {
                         Thread.sleep(1000);
@@ -131,7 +136,24 @@ public class ScenarioUserTask {
             logger.error("Exception {}", e);
         }
     }
+    /**
+     * ExecuteOne Simple execution
+     */
+    public void executeSingleExecutionProcessInstance() throws Exception {
+        try {
+            logger.info("ProcessInstanceWithResult Start");
+                    ExecuteWithResult executeWithResult=withResultAPI.processInstanceWithResult(PROCESS_ID_PROCESSINSTANCE,
+                    Map.of(LogWorker.PROCESS_VARIABLE_PLEASELOG, Boolean.TRUE,
+                            DelayWorker.PROCESS_VARIABLE_CREDITSCORE,
+                            random.nextInt(1000)),  "ProcessWithResult",Duration.ofMinutes(1)).join();
+            logger.info("ProcessInstanceWithResult PI[{}] TimeOut (false expected)? {}",
+                    executeWithResult.processInstance,
+                    executeWithResult.timeOut);
 
+        } catch (Exception e) {
+            logger.error("Exception {}", e);
+        }
+    }
     /**
      *
      */
@@ -142,13 +164,13 @@ public class ScenarioUserTask {
         try {
 
             if (registerUserTask.size() < 10) {
-                engineCommand.createProcessInstances(PROCESS_ID,
+                engineCommand.createProcessInstances(PROCESS_ID_USERTASK,
                         Map.of(LogWorker.PROCESS_VARIABLE_PLEASELOG, pleaseLogWorker, DelayWorker.PROCESS_VARIABLE_CREDITSCORE,
                                 random.nextInt(1000)), 10, pleaseLogWorker.booleanValue());
             }
 
             TaskList tasksList = null;
-            tasksList = engineCommand.searchUserTask(PROCESS_ID);
+            tasksList = engineCommand.searchUserTask(PROCESS_ID_USERTASK);
             // Register the task: the same task can show up multiple time because of the delay between Zee
             logger.info("------------------- Search for userTask to run found[{}]", tasksList.size());
 
@@ -180,7 +202,7 @@ public class ScenarioUserTask {
 
         logger.info("Play with task [{}]", task.getId());
         long beginTimeRun = System.currentTimeMillis();
-        ExecuteWithResult executeWithResult = taskWithResult.executeTaskWithResult(task, true,
+        ExecuteWithResult executeWithResult = withResultAPI.executeTaskWithResult(task, true,
                 "demo",
                 Map.of("Cake", "Cherry"),
                 "UserTaskWithResult",

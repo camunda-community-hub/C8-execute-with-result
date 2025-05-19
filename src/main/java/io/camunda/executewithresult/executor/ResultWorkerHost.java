@@ -90,6 +90,7 @@ public class ResultWorkerHost extends ResultWorker {
         JobWorker worker = mapWorker.get(topicName);
         if (worker == null) {
             synchronized (this) {
+                logger.info("Create worker topic[{}]", topicName);
                 if (mapWorker.get(topicName) == null) {
                     worker = zeebeClient.newWorker()
                             .jobType(topicName)
@@ -97,6 +98,8 @@ public class ResultWorkerHost extends ResultWorker {
                             .streamEnabled(true)
                             .open();
                     mapWorker.put(topicName, worker);
+                } else {
+                    logger.error("Can't create worker, no topic");
                 }
             }
         }
@@ -119,17 +122,17 @@ public class ResultWorkerHost extends ResultWorker {
             jobClient.newCompleteCommand(activatedJob.getKey()).send();
 
             String jobKey = (String) activatedJob.getVariable(WithResultAPI.PROCESS_VARIABLE_JOB_KEY);
-            // logger.info("Handle marker for jobKey[{}]", jobKey);
+            logger.info("Handle marker for jobKey[{}]", jobKey);
             ResultWorkerDynamic.LockObjectTransporter lockObjectTransporter = lockObjectsMap.get(jobKey);
 
             if (lockObjectTransporter == null) {
-                logger.error("No object for jobKey[{}]", jobKey);
+                logger.error("No object for jobKey[{}]", "jobKey");
                 return;
             }
             lockObjectTransporter.processVariables = activatedJob.getVariablesAsMap();
             lockObjectTransporter.elementId = activatedJob.getElementId();
             lockObjectTransporter.elementInstanceKey = activatedJob.getElementInstanceKey();
-            logger.debug("HandleMarkerDynamicWorker jobKey[{}] variables[{}]", jobKey, lockObjectTransporter.processVariables);
+            logger.debug("HandleMarkerDynamicWorker jobKey[{}] variables[{}]", "jobKey", lockObjectTransporter.processVariables);
 
             // notify withResult that we got the answer
             switch (lockObjectTransporter.caller) {

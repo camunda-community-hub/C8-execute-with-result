@@ -30,7 +30,6 @@ public abstract class ResultWorker {
         // ElementKey is the uniq key. Each instance has its own key
         public long elementInstanceKey;
         public long beginTime = System.currentTimeMillis();
-        public int snitchValue;
         public Duration timeoutDuration;
         public Task userTask;
         public CompletableFuture<ExecuteWithResult> future = new CompletableFuture<>();
